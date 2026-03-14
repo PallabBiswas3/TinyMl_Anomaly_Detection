@@ -1,0 +1,46 @@
+# PlatformIO build artifacts
+firmware/.pio/
+firmware/.vscode/.browse.c_cpp.db*
+firmware/.vscode/c_cpp_properties.json
+firmware/.vscode/launch.json
+firmware/.vscode/ipch
+
+# VS Code workspace settings
+.vscode/
+*.code-workspace
+
+# Python training artifacts
+training/__pycache__/
+training/*.pyc
+training/venv/
+training/env/
+training/.env
+*.egg-info/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Model outputs (keep weights, ignore temporary files)
+training/output/*.tmp
+training/output/*.log
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE files
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
