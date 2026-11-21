@@ -16,6 +16,28 @@ libraries. Its weights are compiled into flash as C arrays.
 
 ---
 
+## Web dashboard
+
+`web/` is a static page that runs **the same pipeline with the same trained weights** in the
+browser and explains every part of the project (hardware, data, cleaning, training, model,
+firmware, verification, results). Data sources:
+
+- **Live simulator**, mirroring the firmware's scenarios. You can switch scenarios and inject ghost echoes.
+- **Replay** of the labelled test capture, with ground truth and per-event detection. *Watch* jumps to any event.
+- **Upload** any CSV recorded with `capture_serial.py`.
+- **Connect a real ESP32** over USB (Web Serial, Chrome/Edge). Flash with `-DLOG_RAW=1` so the browser gets every raw reading.
+
+Open `web/index.html` locally, or deploy it with the included GitHub Actions workflow
+(`.github/workflows/pages.yml`). After retraining, refresh and check it:
+
+```bash
+cd training
+python export_web.py     # web/model.js, replay.js, project.js from firmware/include + data
+python verify_web.py     # JS pipeline == Python, sample by sample (needs Node.js)
+```
+
+---
+
 ## The pipeline
 
 ```
@@ -163,6 +185,8 @@ esp32-ultrasonic-anomaly/
 │   ├── pipeline.py           ← Python mirror of the on-device cleaning + evaluation helpers
 │   ├── train.py              ← clean → train → threshold → evaluate → export headers
 │   ├── verify_firmware.py    ← compiles the firmware C++ on the PC, compares with Python
+│   ├── export_web.py         ← model + data for the web dashboard
+│   ├── verify_web.py         ← checks the dashboard's JS pipeline against Python
 │   ├── data/
 │   │   ├── normal/*.csv      ← normal-operation captures (training)
 │   │   └── test/*.csv        ← labelled captures (evaluation) + 1 h soak
@@ -176,6 +200,7 @@ esp32-ultrasonic-anomaly/
     │   ├── preprocess.cpp    ← cleaning + features (pure C++, no Arduino)
     │   └── inference.cpp     ← autoencoder + alarm debounce (pure C++, no Arduino)
     └── test_host/host_check.cpp  ← runs preprocess + inference on the PC
+web/                          ← static dashboard (pipeline.js = JS mirror; model/replay/project.js generated)
 ```
 
 ---

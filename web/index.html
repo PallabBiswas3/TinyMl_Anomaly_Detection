@@ -1,0 +1,585 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 Anomaly Detector</title>
+<meta name="description" content="ESP32 + HC-SR04 TinyML anomaly detector: live in-browser run of the exact on-device pipeline and model, plus how every part of the project works.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-head">
+  <div class="wrap head-inner">
+    <a class="brand" href="#top">ESP32 · HC-SR04 · TinyML</a>
+    <nav class="nav" aria-label="Sections">
+      <a href="#live">Live demo</a>
+      <a href="#overview">Overview</a>
+      <a href="#hardware">Hardware</a>
+      <a href="#data">Data</a>
+      <a href="#cleaning">Cleaning</a>
+      <a href="#training">Training</a>
+      <a href="#model">Model</a>
+      <a href="#firmware">Firmware</a>
+      <a href="#verification">Verification</a>
+      <a href="#results">Results</a>
+      <a href="#code">Code</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+<!-- ── Hero ─────────────────────────────────────────────────────────────── -->
+<section class="wrap hero">
+  <h1>Ultrasonic anomaly detector on an ESP32</h1>
+  <p class="lede">A cheap HC-SR04 distance sensor, a signal-cleaning pipeline and a 118-parameter
+    autoencoder that runs in pure C++ on the microcontroller: no TensorFlow runtime, no heap.
+    This page runs <strong>the same pipeline with the same trained weights</strong> in your browser,
+    so you can watch every step work. It also explains how each part of the project was built.</p>
+  <div class="kpis" id="kpis"></div>
+</section>
+
+<!-- ── Live demo ────────────────────────────────────────────────────────── -->
+<section class="wrap section" id="live">
+  <div class="section-head">
+    <h2>Live demo</h2>
+    <p>Every 200 ms one raw reading goes through the on-device pipeline: validity gate, gap reset,
+      Hampel spike filter, window features, autoencoder, alarm debounce, LED. Pick a data source:</p>
+  </div>
+
+  <div class="toolbar" role="toolbar" aria-label="Demo controls">
+    <div class="seg" role="group" aria-label="Data source" id="seg-mode">
+      <button type="button" data-mode="sim" aria-pressed="true">Live simulator</button>
+      <button type="button" data-mode="replay" aria-pressed="false">Replay labelled test capture</button>
+      <button type="button" data-mode="upload" aria-pressed="false">Upload a CSV</button>
+      <button type="button" data-mode="serial" aria-pressed="false" id="btn-serial">Connect ESP32 (USB)</button>
+    </div>
+    <div class="seg" role="group" aria-label="Playback speed" id="seg-speed">
+      <button type="button" data-speed="1" aria-pressed="true">1×</button>
+      <button type="button" data-speed="5" aria-pressed="false">5×</button>
+      <button type="button" data-speed="20" aria-pressed="false">20×</button>
+    </div>
+    <button type="button" class="btn" id="btn-pause">Pause</button>
+    <button type="button" class="btn" id="btn-restart">Restart</button>
+    <input type="file" id="file-input" accept=".csv,text/csv" hidden>
+  </div>
+
+  <div class="subbar" id="panel-sim">
+    <span class="subbar-label">Scenario</span>
+    <div class="seg" role="group" aria-label="Simulated scenario" id="seg-scen"></div>
+    <button type="button" class="btn btn-accent" id="btn-ghost">Inject ghost echo</button>
+  </div>
+  <div class="subbar" id="panel-replay" hidden>
+    <span class="subbar-label" id="replay-name"></span>
+    <div class="progress" aria-hidden="true"><div id="replay-bar"></div></div>
+    <span class="mono" id="replay-pos"></span>
+  </div>
+  <div class="subbar" id="panel-serial" hidden>
+    <span id="serial-status">Not connected</span>
+    <button type="button" class="btn" id="btn-disconnect">Disconnect</button>
+    <span class="muted small">Flash with <code>-DLOG_RAW=1</code>: the browser then does all the cleaning and
+      inference on the raw stream. In feature mode the device doesn't send invalid readings, so faults can't be seen here.</span>
+  </div>
+
+  <div class="status-row">
+    <div class="card status-card" id="status-card" aria-live="polite">
+      <div class="led-wrap">
+        <div class="led" id="led" aria-hidden="true"></div>
+        <span class="led-cap">LED · GPIO 2</span>
+      </div>
+      <div>
+        <div class="state" id="state"><span class="state-icon" id="state-icon">·</span><span id="state-text">Starting…</span></div>
+        <div class="state-why" id="state-why"></div>
+        <div class="state-src" id="state-src"></div>
+      </div>
+    </div>
+    <div class="tiles" id="tiles"></div>
+  </div>
+
+  <div class="card chart-card">
+    <div class="chart-head">
+      <h3>Distance: raw readings vs cleaned signal <span class="muted">(last 60 s)</span></h3>
+      <ul class="legend" aria-label="Legend">
+        <li><span class="key key-dot"></span>raw reading</li>
+        <li><span class="key key-ring"></span>spike replaced by Hampel</li>
+        <li><span class="key key-line s1"></span>filtered (model input)</li>
+        <li><span class="key key-rug"></span>no valid echo</li>
+        <li><span class="key key-band alarm"></span>alarm</li>
+        <li><span class="key key-band fault"></span>sensor fault</li>
+        <li><span class="key key-truth"></span>ground truth event</li>
+      </ul>
+    </div>
+    <div class="chart-stack" id="chart-stack">
+      <svg id="chart-dist" class="chart" role="img" aria-label="Raw and filtered distance over the last 60 seconds"></svg>
+      <div class="chart-head chart-head-inner">
+        <h3>Anomaly score: autoencoder reconstruction error <span class="muted">(log scale)</span></h3>
+        <ul class="legend">
+          <li><span class="key key-line s1"></span>MSE</li>
+          <li><span class="key key-dash"></span>threshold</li>
+          <li><span class="key key-dot crit"></span>above threshold</li>
+        </ul>
+      </div>
+      <svg id="chart-mse" class="chart" role="img" aria-label="Reconstruction error over the last 60 seconds, with the anomaly threshold"></svg>
+      <div class="tooltip" id="tooltip" hidden></div>
+    </div>
+  </div>
+
+  <h3 class="strip-title">What the device does with the latest reading</h3>
+  <ol class="stages" id="stages"></ol>
+
+  <div class="two-col">
+    <div class="card">
+      <h3>Inside the autoencoder</h3>
+      <p class="small muted">4 features in → squeezed through 2 numbers → 4 features out. Trained only on normal data,
+        it reconstructs normal readings well. Anything it can't reconstruct gets a large error.</p>
+      <svg id="net" class="net" viewBox="0 0 360 190" role="img" aria-label="Autoencoder layer activations"></svg>
+      <table class="ae-table" id="ae-table">
+        <thead><tr><th>Feature</th><th>Value</th><th>Normalized in <span class="key key-line s1"></span> / out <span class="key key-line s2"></span></th><th>(in−out)²</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h3>Event log</h3>
+      <ul class="log" id="log" aria-live="polite"></ul>
+    </div>
+  </div>
+
+  <div class="card" id="events-card" hidden>
+    <h3>Events in this capture <span class="muted" id="events-sub"></span></h3>
+    <p class="small muted">Computed by running the full device logic over the whole file. Click <em>Watch</em> to jump
+      to 5 s before an event and see it happen.</p>
+    <div class="table-scroll"><table class="data-table" id="events-table">
+      <thead><tr><th>#</th><th>Scenario</th><th>Starts at</th><th>Detected</th><th>Latency</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </div>
+</section>
+
+<!-- ── Overview ─────────────────────────────────────────────────────────── -->
+<section class="wrap section" id="overview">
+  <div class="section-head">
+    <h2>How the pieces fit together</h2>
+    <p>Three places run code: the PC (training), the ESP32 (detection), and this page (a verified copy of the device logic).
+      The cleaning pipeline is written <strong>three times</strong> and checked to agree, so the model always sees
+      the same kind of data in training as in the field.</p>
+  </div>
+  <div class="flow">
+    <div class="lane">
+      <div class="lane-title">PC · <code>training/</code></div>
+      <div class="node"><b>1 · Get raw data</b><span><code>generate_data.py</code> (synthetic, physical noise model) or
+        <code>capture_serial.py</code> (record a real ESP32)</span></div>
+      <div class="arrow">↓ <code>data/{normal,test}/*.csv</code></div>
+      <div class="node"><b>2 · Clean + train</b><span><code>train.py</code>: same cleaning as the device
+        (<code>pipeline.py</code>), drop contamination, train autoencoder on normal data, pick threshold, evaluate</span></div>
+      <div class="arrow">↓ export + self-check</div>
+      <div class="node"><b>3 · Generated headers</b><span><code>model_data.h</code> (pipeline settings, threshold,
+        normalization) + <code>model_weights.h</code> (118 floats)</span></div>
+    </div>
+    <div class="lane">
+      <div class="lane-title">ESP32 · <code>firmware/</code></div>
+      <div class="node"><b>4 · Build &amp; flash</b><span>PlatformIO compiles the headers into flash; no model file is loaded at runtime</span></div>
+      <div class="arrow">↓ every 200 ms</div>
+      <div class="node"><b>5 · Detect</b><span><code>sensor.cpp</code> raw reading → <code>preprocess.cpp</code> cleaning →
+        <code>inference.cpp</code> autoencoder + debounce → LED</span></div>
+      <div class="arrow">↓ USB serial, 115200 baud</div>
+      <div class="node"><b>6 · Log</b><span>CSV lines (raw or features + MSE + alarm), <code>#</code> status lines, 60 s summary</span></div>
+    </div>
+    <div class="lane">
+      <div class="lane-title">Browser · <code>web/</code></div>
+      <div class="node"><b>7 · Export</b><span><code>export_web.py</code> turns the flashed headers into <code>model.js</code>
+        and adds a labelled test capture</span></div>
+      <div class="arrow">↓</div>
+      <div class="node"><b>8 · This page</b><span><code>pipeline.js</code> runs the device logic on simulated, recorded,
+        uploaded or live USB data</span></div>
+      <div class="arrow">↓ checked by</div>
+      <div class="node"><b>9 · Verification</b><span><code>verify_firmware.py</code>: C++ = Python ·
+        <code>verify_web.py</code>: JS = Python, sample by sample</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Hardware ─────────────────────────────────────────────────────────── -->
+<section class="wrap section" id="hardware">
+  <div class="section-head">
+    <h2>Hardware</h2>
+    <p>An ESP32 dev board, an HC-SR04 ultrasonic sensor and two resistors. The sensor sends a 40 kHz ping and holds
+      ECHO high for the round-trip time: distance = echo µs × 0.01715 cm (343 m/s ÷ 2).</p>
+  </div>
+  <div class="two-col">
+    <div class="card">
+      <svg class="wiring" viewBox="0 0 620 300" role="img" aria-label="Wiring: HC-SR04 VCC to 5V, GND to GND, TRIG to GPIO5, ECHO through a 1k/2k divider to GPIO18; LED on GPIO2">
+        <!-- HC-SR04 -->
+        <rect class="w-board" x="20" y="40" width="190" height="110" rx="6"/>
+        <circle class="w-trans" cx="70" cy="85" r="30"/><circle class="w-trans-in" cx="70" cy="85" r="18"/>
+        <circle class="w-trans" cx="160" cy="85" r="30"/><circle class="w-trans-in" cx="160" cy="85" r="18"/>
+        <text class="w-title" x="115" y="32" text-anchor="middle">HC-SR04</text>
+        <g class="w-pin-labels">
+          <text x="48" y="144" text-anchor="middle">VCC</text><text x="92" y="144" text-anchor="middle">TRIG</text>
+          <text x="136" y="144" text-anchor="middle">ECHO</text><text x="180" y="144" text-anchor="middle">GND</text>
+        </g>
+        <!-- ESP32 -->
+        <rect class="w-board" x="400" y="20" width="200" height="260" rx="6"/>
+        <rect class="w-chip" x="450" y="40" width="100" height="70" rx="3"/>
+        <text class="w-title" x="500" y="80" text-anchor="middle">ESP32</text>
+        <g class="w-pin-labels" text-anchor="end">
+          <text x="590" y="146">5V / VIN</text><text x="590" y="176">GPIO5</text>
+          <text x="590" y="206">GPIO18</text><text x="590" y="236">GND</text><text x="590" y="266">GPIO2 · LED</text>
+        </g>
+        <circle class="w-ledmark" cx="420" cy="262" r="6"/>
+        <!-- wires -->
+        <path class="w-wire w-5v"  d="M48 150 V170 H300 V142 H400"/>
+        <path class="w-wire w-trig" d="M92 150 V190 H320 V172 H400"/>
+        <path class="w-wire w-echo" d="M136 150 V210 H230"/>
+        <path class="w-wire w-echo3" d="M290 210 H340 V202 H400"/>
+        <path class="w-wire w-gnd" d="M180 150 V285 H360 V232 H400"/>
+        <path class="w-wire w-gnd" d="M260 225 V285"/>
+        <!-- divider -->
+        <rect class="w-res" x="230" y="203" width="60" height="14" rx="3"/>
+        <text class="w-small" x="260" y="198" text-anchor="middle">1 kΩ</text>
+        <rect class="w-res" x="253" y="225" width="14" height="40" rx="3" transform="rotate(0)"/>
+        <text class="w-small" x="275" y="250">2 kΩ</text>
+        <circle class="w-node" cx="260" cy="210" r="3"/>
+        <path class="w-wire w-echo3" d="M260 210 V225"/>
+        <text class="w-small" x="300" y="135">5 V</text>
+        <text class="w-small" x="345" y="196">3.3 V-safe</text>
+      </svg>
+    </div>
+    <div class="card">
+      <table class="data-table">
+        <thead><tr><th>HC-SR04</th><th>ESP32</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td>VCC</td><td>5V / VIN</td><td>The sensor needs 5 V; at 3.3 V it is unreliable</td></tr>
+          <tr><td>TRIG</td><td>GPIO5</td><td>10 µs pulse starts a measurement</td></tr>
+          <tr><td>ECHO</td><td>GPIO18 via 1 k / 2 k divider</td><td>ECHO swings 5 V; ESP32 pins are 3.3 V max (5 V × 2/3 ≈ 3.3 V)</td></tr>
+          <tr><td>GND</td><td>GND</td><td>Common ground</td></tr>
+          <tr><td>—</td><td>GPIO2 (onboard LED)</td><td>On while an alarm or a sensor fault is active</td></tr>
+        </tbody>
+      </table>
+      <ul class="facts">
+        <li><b>Sampling:</b> 5 Hz (200 ms). The HC-SR04 needs ≥ 60 ms between pings for echoes to die out.</li>
+        <li><b>Timeout:</b> 25 ms (~4.3 m). A missing echo returns −1, which the pipeline treats as invalid.</li>
+        <li><b>CPU:</b> 80 MHz. One sample needs a few µs of maths, and the core sleeps in <code>delay()</code> between samples.</li>
+        <li><b>No sensor?</b> The default build (<code>SENSOR_SIMULATION=1</code>) simulates one, with dropouts and ghost echoes.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ── Data ─────────────────────────────────────────────────────────────── -->
+<section class="wrap section" id="data">
+  <div class="section-head">
+    <h2>Data: raw, messy, realistic</h2>
+    <p>Training data has exactly the format the firmware prints in raw mode (<code>timestamp_ms,distance_cm</code>,
+      −1 = no echo), so a real capture can replace a synthetic one 1:1. The synthetic generator models what goes
+      wrong with a real ultrasonic sensor:</p>
+  </div>
+  <div class="two-col">
+    <div class="card">
+      <h3>Effects in <code>generate_data.py</code></h3>
+      <ul class="facts">
+        <li><b>Measurement noise:</b> Gaussian, with a different level per session (surface, angle, supply ripple)</li>
+        <li><b>Temperature drift:</b> speed of sound = 331.3 + 0.606·T m/s, but the firmware assumes 343 m/s</li>
+        <li><b>Quantization:</b> <code>pulseIn()</code> returns whole µs (0.017 cm steps)</li>
+        <li><b>Dropped echoes:</b> −1 timeouts, single and in bursts, more frequent at long range</li>
+        <li><b>Ghost echoes:</b> multipath double-bounce (2× distance), side reflectors, random junk</li>
+        <li><b>Blind zone / over-range:</b> ringing gives &lt; 2 cm, far targets give &gt; 400 cm</li>
+        <li><b>Timing:</b> loop jitter, serial stalls, lost lines</li>
+        <li><b>Contamination:</b> "normal" sessions include someone reaching into the beam, as real ones do</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Raw-data problems found in each capture</h3>
+      <div class="table-scroll"><table class="data-table num" id="quality-table">
+        <thead><tr><th>Capture</th><th>Use</th><th>Minutes</th><th>Rows</th><th>Timeouts</th><th>&lt; 2 cm</th><th>&gt; 400 cm</th><th>Gaps</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <p class="small muted">As reported by <code>pipeline.raw_quality()</code>. All data here is synthetic (seed 7). For a real
+        deployment, record with <code>capture_serial.py</code> and retrain.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ── Cleaning ─────────────────────────────────────────────────────────── -->
+<section class="wrap section" id="cleaning">
+  <div class="section-head">
+    <h2>On-device cleaning</h2>
+    <p>Four steps run on the ESP32 before the model sees anything. The parameters are defined once in
+      <code>pipeline.py</code> and generated into <code>model_data.h</code>, so device and training cannot drift apart.</p>
+  </div>
+  <ol class="steps" id="clean-steps"></ol>
+  <div class="card chart-card">
+    <div class="chart-head">
+      <h3>Why a Hampel filter, not a median filter</h3>
+      <ul class="legend">
+        <li><span class="key key-dot"></span>raw reading</li>
+        <li><span class="key key-line s1"></span>Hampel-7 (used)</li>
+        <li><span class="key key-line s2"></span>median-5 (rejected)</li>
+      </ul>
+    </div>
+    <p class="small muted" id="hampel-caption"></p>
+    <div class="chart-stack"><svg id="chart-hampel" class="chart" role="img" aria-label="Raw vibration readings with Hampel and median filter outputs"></svg></div>
+    <p class="small">A median filter wider than the vibration period cancels the vibration, because the samples walk around
+      the sine and the median sits in the middle. In testing, a ±3 cm vibration at 1.7 Hz was detected
+      <b>21 %</b> of the time with median-5 and <b>99 %</b> with Hampel-7. The Hampel filter only replaces a reading
+      that is an outlier relative to the spread of its neighbours.</p>
+  </div>
+</section>
+
+<!-- ── Training ─────────────────────────────────────────────────────────── -->
+<section class="wrap section" id="training">
+  <div class="section-head">
+    <h2>Training on the PC</h2>
+    <p><code>train.py</code> runs six steps in about 40 s on a CPU. The model is unsupervised: it only ever sees normal data.</p>
+  </div>
+  <ol class="steps">
+    <li><b>Load</b> raw captures and report their problems (table above).</li>
+    <li><b>On-device cleaning</b>: the exact Python mirror of the firmware turns every raw reading into 4 features.</li>
+    <li><b>Offline contamination removal</b> (PC only): rows whose distance leaves the session's robust baseline
+      (median ± 6·MAD, min 2 cm) are dropped, along with neighbouring rows whose feature window overlaps the event.</li>
+    <li><b>Train</b> the 4-8-2-8-4 autoencoder (Adam, MSE loss, early stopping). Chronological 80/20 split per recording:
+      no shuffled leakage between train and validation.</li>
+    <li><b>Threshold</b> = 99.9th percentile of the reconstruction error on normal data. Normal error is heavy-tailed,
+      and mean + 3σ gave tens of false alarms per hour.</li>
+    <li><b>Evaluate</b> the complete device logic per anomaly event, then <b>export</b> the C headers, re-check them
+      against Keras, and copy them into <code>firmware/include</code>.</li>
+  </ol>
+  <div class="two-col">
+    <div class="card">
+      <h3>Training set after cleaning</h3>
+      <div class="table-scroll"><table class="data-table num" id="train-table">
+        <thead><tr><th>Session</th><th>Valid rows</th><th>Contamination dropped</th><th>Kept for training</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <h3 class="mt">Normalization (min-max from training data)</h3>
+      <div class="table-scroll"><table class="data-table num" id="norm-table">
+        <thead><tr><th>Feature</th><th>Min</th><th>Max</th><th>Meaning</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <p class="small muted">The device multiplies by a precomputed 1/range, so it never divides.</p>
+    </div>
+    <div class="card chart-card">
+      <div class="chart-head">
+        <h3>Where the threshold sits</h3>
+      </div>
+      <p class="small muted">Share of samples per reconstruction-error bin (log scale). Normal data piles up far left, and anomalies
+        land orders of magnitude to the right of the threshold.</p>
+      <div class="chart-stack" id="hist-stack">
+        <svg id="chart-hist" class="chart" role="img" aria-label="Histograms of reconstruction error for normal and anomalous samples with the threshold"></svg>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Model ────────────────────────────────────────────────────────────── -->
+<section class="wrap section" id="model">
+  <div class="section-head">
+    <h2>The model: a 472-byte autoencoder</h2>
+    <p>No TFLite Micro runtime (~300 KB). The Keras weights are exported as C arrays, and the forward pass is a
+      templated <code>dense&lt;IN,OUT,ACT&gt;</code> function, so the compiler checks every shape and unrolls the loops.</p>
+  </div>
+  <div class="two-col">
+    <div class="card">
+      <div class="table-scroll"><table class="data-table num">
+        <thead><tr><th>Layer</th><th>Shape</th><th>Activation</th><th>Params</th><th>MACs</th></tr></thead>
+        <tbody>
+          <tr><td>enc1</td><td>4 → 8</td><td>ReLU</td><td>40</td><td>32</td></tr>
+          <tr><td>latent</td><td>8 → 2</td><td>ReLU</td><td>18</td><td>16</td></tr>
+          <tr><td>dec1</td><td>2 → 8</td><td>ReLU</td><td>24</td><td>16</td></tr>
+          <tr><td>out</td><td>8 → 4</td><td>Sigmoid</td><td>36</td><td>32</td></tr>
+          <tr class="total"><td>Total</td><td></td><td></td><td>118 (472 B)</td><td>96</td></tr>
+        </tbody>
+      </table></div>
+      <h3 class="mt">The 4 input features (one row per valid reading)</h3>
+      <div class="table-scroll"><table class="data-table">
+        <thead><tr><th>Feature</th><th>Computed as</th><th>Catches</th></tr></thead>
+        <tbody>
+          <tr><td>distance</td><td>Hampel-filtered reading</td><td>obstruction, object removed, displaced</td></tr>
+          <tr><td>jitter</td><td>std dev over last 8 filtered</td><td>vibration, instability</td></tr>
+          <tr><td>rate of change</td><td>|Δ filtered| per second</td><td>sudden movement</td></tr>
+          <tr><td>variance</td><td>variance over last 8 filtered</td><td>erratic behaviour</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+    <div class="card">
+      <h3>On-device footprint</h3>
+      <div class="table-scroll"><table class="data-table num">
+        <thead><tr><th>Component</th><th>Size</th><th>Where</th></tr></thead>
+        <tbody>
+          <tr><td>Weights + biases</td><td>472 B (118 floats)</td><td>flash (.rodata)</td></tr>
+          <tr><td>Inference code</td><td>~0.5 KB</td><td>flash</td></tr>
+          <tr><td>Cleaning + features code</td><td>~0.6 KB</td><td>flash</td></tr>
+          <tr><td>Preprocessor state</td><td>80 B</td><td>RAM</td></tr>
+          <tr><td>Heap</td><td>0 B</td><td>none</td></tr>
+        </tbody>
+      </table></div>
+      <pre class="code"><code>template &lt;int IN, int OUT, Activation ACT&gt;
+inline void dense(const float (&amp;in)[IN],
+                  const float (&amp;W)[IN][OUT], const float (&amp;B)[OUT],
+                  float (&amp;out)[OUT]) {
+    for (int j = 0; j &lt; OUT; ++j) {
+        float sum = B[j];
+        for (int i = 0; i &lt; IN; ++i) sum += in[i] * W[i][j];
+        out[j] = (ACT == RELU) ? relu(sum) : sigmoid(sum);
+    }
+}</code></pre>
+      <p class="small muted">Single-precision floats only (the ESP32 FPU has no double support). The browser copy
+        rounds to float32 the same way.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ── Firmware ─────────────────────────────────────────────────────────── -->
+<section class="wrap section" id="firmware">
+  <div class="section-head">
+    <h2>Firmware</h2>
+    <p>Arduino framework on PlatformIO. Only <code>main.cpp</code> and <code>sensor.cpp</code> touch Arduino APIs, and the
+      cleaning and inference files are plain C++, so they also compile on a PC for verification.</p>
+  </div>
+  <div class="two-col">
+    <div class="card">
+      <h3>The 200 ms loop (<code>main.cpp</code>)</h3>
+      <ol class="steps compact">
+        <li><b>Sleep</b> in <code>delay()</code> until the next slot. The FreeRTOS idle task halts the core instead of busy-waiting.</li>
+        <li><b>Acquire</b> one raw reading: <code>SensorManager::read()</code> (HC-SR04 or simulator).</li>
+        <li><b>Clean</b>: <code>SignalPreprocessor::push()</code> returns features, or <i>invalid</i>. 5 invalid in a row = sensor fault.</li>
+        <li><b>Infer</b>: <code>InferenceEngine::run()</code> (timed with <code>micros()</code>) gives the MSE and whether it is over the threshold.</li>
+        <li><b>Decide</b>: <code>AlarmFilter</code> raises the alarm after 3 anomalous samples in a row and clears it after 3 normal ones.
+          LED = alarm OR fault.</li>
+        <li><b>Log</b> a CSV line. Every 60 s a <code>#</code> summary: readings, invalid, spikes removed, alarms, faults, inference µs, power estimate, free heap.</li>
+      </ol>
+    </div>
+    <div class="card">
+      <h3>Build flags (<code>platformio.ini</code>)</h3>
+      <div class="table-scroll"><table class="data-table">
+        <thead><tr><th>Flag</th><th>Default</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td><code>SENSOR_SIMULATION</code></td><td>1</td><td>1 = built-in simulator cycling 8 × 10 s scenarios; 0 = real HC-SR04</td></tr>
+          <tr><td><code>LOG_RAW</code></td><td>0</td><td>1 = print only <code>timestamp_ms,distance_cm</code> (for recording data / this page)</td></tr>
+          <tr><td><code>CPU_FREQ_MHZ</code></td><td>80</td><td>80 / 160 / 240. 80 MHz is &lt; 1 % load at roughly half the current of 240 MHz</td></tr>
+        </tbody>
+      </table></div>
+      <h3 class="mt">Serial output (feature mode)</h3>
+      <pre class="code small"><code>timestamp_ms,raw_cm,filtered_cm,jitter,rate_of_change,variance,mse,anomaly,alarm,inference_us
+20200,30.32,30.32,0.1966,0.4020,0.0386,0.004805,0,0,…    normal
+75200,67.54,30.22,0.1704,0.2000,0.0290,0.006120,0,0,…    double-bounce removed
+124400,150.49,150.49,58.5086,37.3367,3423.25,92512840,1,1,…   ALARM: object removed
+# [Sensor] FAULT: no valid echo for ~1 s</code></pre>
+      <p class="small muted">Non-data lines start with <code>#</code>, so <code>capture_serial.py</code>, pandas and this page can parse the stream directly.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ── Verification ─────────────────────────────────────────────────────── -->
+<section class="wrap section" id="verification">
+  <div class="section-head">
+    <h2>Verification: one pipeline, three languages</h2>
+    <p>If the device cleaned data even slightly differently from training, the model would be scoring data it never
+      learned. So the logic is mirrored and checked automatically.</p>
+  </div>
+  <div class="verify">
+    <div class="card vnode"><b>pipeline.py</b><span>Source of truth for every parameter. Used by training.</span></div>
+    <div class="vlink"><span>verify_firmware.py</span><small>g++ builds <code>preprocess.cpp</code> + <code>inference.cpp</code> with
+      <code>host_check.cpp</code>, replays the test captures, compares every sample</small></div>
+    <div class="card vnode"><b>preprocess.cpp · inference.cpp</b><span>What runs on the ESP32.</span></div>
+    <div class="vlink"><span>verify_web.py</span><small>Node runs <code>pipeline.js</code> on the same captures. Filtered values identical,
+      MSE within float32 rounding, 0 LED mismatches</small></div>
+    <div class="card vnode"><b>pipeline.js</b><span>What runs on this page.</span></div>
+  </div>
+  <p class="small muted">train.py also checks that its C-style forward pass matches Keras, and that the exported headers
+    round-trip, before copying them to the firmware.</p>
+</section>
+
+<!-- ── Results ──────────────────────────────────────────────────────────── -->
+<section class="wrap section" id="results">
+  <div class="section-head">
+    <h2>Results</h2>
+    <p>Event-based evaluation of the complete device logic (cleaning + model + debounce + fault detection), computed
+      from the current model by <code>export_web.py</code>. An event counts as detected if the LED comes on during it
+      (or within 3 s after it ends).</p>
+  </div>
+  <div class="kpis" id="result-kpis"></div>
+  <div class="two-col">
+    <div class="card">
+      <h3>Per scenario</h3>
+      <div class="table-scroll"><table class="data-table num" id="scen-table">
+        <thead><tr><th>Scenario</th><th>Detected</th><th>Latency</th><th>Detected by</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </div>
+    <div class="card">
+      <h3>What the cleaning is worth</h3>
+      <div class="table-scroll"><table class="data-table num">
+        <thead><tr><th></th><th>With cleaning</th><th>Without cleaning</th></tr></thead>
+        <tbody>
+          <tr><td>Events detected</td><td><b>20 / 20</b></td><td>4 / 20 (sensor faults only)</td></tr>
+          <tr><td>False alarms</td><td><b>0 / hour</b></td><td>3.2 / hour</td></tr>
+        </tbody>
+      </table></div>
+      <p class="small muted">From <code>train.py --compare-raw</code>, which trains a second model on uncleaned data. Without
+        cleaning, spikes stretch the normalization range, so real anomalies look tiny to the model.</p>
+      <h3 class="mt">Limits, stated honestly</h3>
+      <ul class="facts">
+        <li>All numbers come from <b>synthetic</b> data. Real deployments should retrain on their own captures.</li>
+        <li>A 5 Hz sensor only sees vibration through aliasing. Vibration at an exact multiple of 5 Hz is invisible.</li>
+        <li>A sensor stuck on a constant valid value looks like a perfectly still object.</li>
+        <li>The 19 µs inference benchmark predates the current pipeline and the 80 MHz default. The firmware prints a fresh measurement every 60 s.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ── Code ─────────────────────────────────────────────────────────────── -->
+<section class="wrap section" id="code">
+  <div class="section-head">
+    <h2>Code &amp; commands</h2>
+  </div>
+  <div class="two-col">
+    <div class="card">
+      <pre class="code small"><code>training/
+  generate_data.py    synthetic raw captures (physical noise model)
+  capture_serial.py   record a real ESP32 (LOG_RAW=1)
+  pipeline.py         on-device mirror + evaluation helpers
+  train.py            clean → train → threshold → evaluate → export
+  verify_firmware.py  C++ vs Python
+  export_web.py       model + data for this page
+  verify_web.py       JS vs Python
+firmware/
+  platformio.ini      SENSOR_SIMULATION, LOG_RAW, CPU_FREQ_MHZ
+  include/model_*.h   generated by train.py
+  src/main.cpp        scheduler, alarm/fault, logging
+  src/sensor.cpp      HC-SR04 driver + simulator
+  src/preprocess.cpp  cleaning + features (pure C++)
+  src/inference.cpp   autoencoder + debounce (pure C++)
+web/                  this page (static, no build step)</code></pre>
+    </div>
+    <div class="card">
+      <pre class="code small"><code>cd training
+python generate_data.py         # synthetic data (seed 7)
+python train.py                 # ~40 s, copies headers to firmware
+python verify_firmware.py       # C++ == Python
+python export_web.py            # refresh this page's model + data
+python verify_web.py            # JS == Python
+
+cd ../firmware
+pio run -t upload               # flash (simulation by default)
+pio device monitor -b 115200</code></pre>
+      <p><a class="btn btn-link" href="https://github.com/PallabBiswas3/TinyMl_Anomaly_Detection">View the repository on GitHub →</a></p>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="wrap foot small muted">
+  Everything on this page runs in your browser. Synthetic data unless you connect a device or upload a capture.
+</footer>
+
+<script src="model.js"></script>
+<script src="replay.js"></script>
+<script src="project.js"></script>
+<script src="pipeline.js"></script>
+<script src="app.js"></script>
+<script src="sections.js"></script>
+</body>
+</html>
