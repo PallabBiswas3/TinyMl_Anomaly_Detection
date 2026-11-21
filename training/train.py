@@ -1,263 +1,305 @@
 """
-ESP32 Ultrasonic Anomaly Detector — Training Pipeline
+ESP32 Ultrasonic Anomaly Detector - Training Pipeline
 ======================================================
-Uses HC-SR04 distance readings as input features.
+Raw recordings  ──▶  clean  ──▶  features  ──▶  autoencoder  ──▶  C headers
 
-Features extracted from a rolling window of distance readings:
-  [0] distance_cm     — raw distance (cm)
-  [1] jitter          — std deviation over last N readings (instability)
-  [2] rate_of_change  — abs(current - previous) per second (sudden moves)
-  [3] variance        — variance over last N readings
+  1. Load raw captures (firmware LOG_RAW format) and report their problems
+  2. On-device cleaning, mirrored exactly from the firmware (pipeline.py):
+       validity gate → gap reset → Hampel spike filter → 8-sample window features
+  3. Offline cleaning (PC only): drop contaminated stretches from the normal data
+  4. Train a 4-8-2-8-4 autoencoder on normal data only (unsupervised)
+  5. Pick the threshold, then evaluate the *complete* device logic
+     (cleaning + model + alarm debounce + fault detection) on labelled test
+     recordings, per anomaly event
+  6. Export model_data.h / model_weights.h, verify them, copy into firmware/include
 
-Anomaly scenarios this detects:
-  - Object too close  (< safe zone)
-  - Object too far / missing (> expected range)
-  - Erratic movement  (high jitter/variance)
-  - Sudden position change (high rate_of_change)
+Usage:
+  python train.py                       # uses data/normal/*.csv and data/test/*.csv
+  python train.py --normal-dir my_caps  # your own real recordings
+  python train.py --compare-raw         # also train a model WITHOUT cleaning, for comparison
 """
 
-import numpy as np
+import argparse
 import os
+import shutil
+import sys
+
+import numpy as np
+
+import pipeline as P
 
 try:
     import tensorflow as tf
     from tensorflow import keras
-    TF_AVAILABLE = True
 except ImportError:
-    TF_AVAILABLE = False
-    print("⚠️  TensorFlow not installed. Run: pip install tensorflow")
-    print("   Continuing in SIMULATION MODE\n")
+    sys.exit("TensorFlow is required. Run: pip install -r requirements.txt")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-INPUT_DIM   = 4       # [distance, jitter, rate_of_change, variance]
-LATENT_DIM  = 2       # bottleneck
-EPOCHS      = 100
-BATCH_SIZE  = 32
-N_NORMAL    = 3000
-N_ANOMALY   = 400
-OUTPUT_DIR  = "output"
+SCRIPT_DIR       = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR       = os.path.join(SCRIPT_DIR, "output")
+FIRMWARE_INCLUDE = os.path.join(SCRIPT_DIR, "..", "firmware", "include")
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+LATENT_DIM      = 2
+EPOCHS          = 200
+BATCH_SIZE      = 64
+VAL_FRACTION    = 0.2       # last 20 % of every recording (chronological split)
+# Threshold = this percentile of reconstruction MSE over all cleaned normal data.
+# Normal MSE is heavy-tailed, so mean + 3σ sits inside the tail and causes
+# frequent false alarms; a high percentile + the alarm debounce does not.
+THRESHOLD_PERCENTILE = 99.9
+SEED            = 42
 
-# ── 1. Data Generation ────────────────────────────────────────────────────────
 
-def simulate_window_features(
-    mean_dist, std_dist, jitter_scale, roc_scale, n, seed
-) -> np.ndarray:
-    """
-    Simulate extracted window features for a given operating condition.
-    Each sample = [distance_cm, jitter, rate_of_change, variance]
-    """
-    rng = np.random.default_rng(seed)
-    distance       = rng.normal(mean_dist, std_dist,     (n, 1)).clip(2, 400)
-    jitter         = np.abs(rng.normal(0,  jitter_scale, (n, 1)))
-    rate_of_change = np.abs(rng.normal(0,  roc_scale,    (n, 1)))
-    variance       = jitter ** 2 + rng.normal(0, 0.01,   (n, 1))
-    return np.hstack([distance, jitter, rate_of_change, variance]).astype(np.float32)
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-print("── Step 1: Generating ultrasonic data ──────────────────────────")
+def banner(title):
+    print(f"\n── {title} " + "─" * max(0, 62 - len(title)))
 
-# Normal: object sitting ~30cm away, stable
-normal_data = simulate_window_features(
-    mean_dist=30.0, std_dist=1.5,
-    jitter_scale=0.3, roc_scale=0.2,
-    n=N_NORMAL, seed=42
-)
 
-# Anomaly 1: object too close (<10cm) — obstruction
-anomaly_close = simulate_window_features(
-    mean_dist=6.0, std_dist=1.0,
-    jitter_scale=0.5, roc_scale=0.8,
-    n=N_ANOMALY // 2, seed=10
-)
+def build_dataset(captures, filter_size, offline_clean):
+    """Features for training/validation from normal captures."""
+    train, val = [], []
+    print(f"  {'capture':<26}{'valid':>7}{'contam.':>9}{'kept':>7}")
+    for cap in captures:
+        feats, valid, _ = P.process_stream(cap.ts, cap.raw, filter_size)
+        keep = valid.copy()
+        dropped = 0
+        if offline_clean:
+            contam  = P.contamination_mask(feats, valid)
+            dropped = int(contam.sum())
+            keep   &= ~contam
+        rows  = feats[keep].astype(np.float32)
+        split = int(len(rows) * (1 - VAL_FRACTION))
+        train.append(rows[:split])
+        val.append(rows[split:])
+        print(f"  {cap.name:<26}{int(valid.sum()):>7}{dropped:>9}{len(rows):>7}")
+    return np.vstack(train), np.vstack(val)
 
-# Anomaly 2: object missing / too far (>80cm) — object fell off
-anomaly_far = simulate_window_features(
-    mean_dist=150.0, std_dist=10.0,
-    jitter_scale=5.0, roc_scale=8.0,
-    n=N_ANOMALY // 2, seed=11
-)
 
-anomaly_data = np.vstack([anomaly_close, anomaly_far])
-
-# ── Normalize ─────────────────────────────────────────────────────────────────
-
-data_min = normal_data.min(axis=0)
-data_max = normal_data.max(axis=0)
-
-def normalize(x):
-    return (x - data_min) / (data_max - data_min + 1e-8)
-
-normal_norm  = normalize(normal_data)
-anomaly_norm = normalize(anomaly_data)
-
-split   = int(0.8 * N_NORMAL)
-X_train = normal_norm[:split]
-X_val   = normal_norm[split:]
-
-print(f"  Normal samples   : {N_NORMAL}  (object at ~30cm, stable)")
-print(f"  Anomaly samples  : {N_ANOMALY} (too close / too far / erratic)")
-print(f"  Features         : [distance_cm, jitter, rate_of_change, variance]")
-print(f"  Norm min: {data_min}")
-print(f"  Norm max: {data_max}\n")
-
-np.save(os.path.join(OUTPUT_DIR, "norm_min.npy"), data_min)
-np.save(os.path.join(OUTPUT_DIR, "norm_max.npy"), data_max)
-
-# ── 2. Build & Train ──────────────────────────────────────────────────────────
-
-def build_autoencoder(input_dim, latent_dim):
-    inp    = keras.Input(shape=(input_dim,), name="sensor_input")
+def build_autoencoder():
+    inp    = keras.Input(shape=(P.INPUT_DIM,), name="sensor_input")
     x      = keras.layers.Dense(8,          activation="relu",    name="enc1")(inp)
-    latent = keras.layers.Dense(latent_dim, activation="relu",    name="latent")(x)
+    latent = keras.layers.Dense(LATENT_DIM, activation="relu",    name="latent")(x)
     x      = keras.layers.Dense(8,          activation="relu",    name="dec1")(latent)
-    out    = keras.layers.Dense(input_dim,  activation="sigmoid", name="out")(x)
+    out    = keras.layers.Dense(P.INPUT_DIM, activation="sigmoid", name="out")(x)
     return keras.Model(inp, out, name="ultrasonic_autoencoder")
 
-if TF_AVAILABLE:
-    print("── Step 2: Training autoencoder ────────────────────────────────")
-    model = build_autoencoder(INPUT_DIM, LATENT_DIM)
-    model.summary()
-    model.compile(optimizer="adam", loss="mse")
-    model.fit(X_train, X_train,
-              epochs=EPOCHS, batch_size=BATCH_SIZE,
-              validation_data=(X_val, X_val), verbose=1)
 
-    # ── 3. Threshold ──────────────────────────────────────────────────────────
-    print("\n── Step 3: Computing threshold ─────────────────────────────────")
+LAYER_NAMES = [("enc1", "ENC1"), ("latent", "ENC2"), ("dec1", "DEC1"), ("out", "DEC2")]
 
-    def compute_mse(model, data):
-        pred = model.predict(data, verbose=0)
-        return np.mean(np.square(data - pred), axis=1)
 
-    val_err   = compute_mse(model, X_val)
-    anom_err  = compute_mse(model, anomaly_norm)
-    threshold = float(np.mean(val_err) + 3 * np.std(val_err))
+def train_model(train_raw, val_raw):
+    """Returns (keras model, layers, norm_min, norm_scale, threshold, val_mse)."""
+    norm_min   = train_raw.min(axis=0)
+    rng_       = train_raw.max(axis=0) - norm_min
+    norm_scale = np.where(rng_ > 1e-12, 1.0 / np.maximum(rng_, 1e-12), 0.0).astype(np.float32)
+    X_train    = ((train_raw - norm_min) * norm_scale).astype(np.float32)
+    X_val      = ((val_raw   - norm_min) * norm_scale).astype(np.float32)
 
-    recall = np.sum(anom_err > threshold) / len(anom_err)
-    fp     = np.sum(val_err  > threshold)
+    tf.keras.utils.set_random_seed(SEED)
+    model = build_autoencoder()
+    model.compile(optimizer=keras.optimizers.Adam(1e-2), loss="mse")
+    hist = model.fit(
+        X_train, X_train, epochs=EPOCHS, batch_size=BATCH_SIZE,
+        validation_data=(X_val, X_val), verbose=0,
+        callbacks=[
+            keras.callbacks.ReduceLROnPlateau(factor=0.5, patience=8, min_lr=1e-4),
+            keras.callbacks.EarlyStopping(patience=25, restore_best_weights=True),
+        ],
+    )
+    print(f"  epochs: {len(hist.history['loss'])}   best val loss: {min(hist.history['val_loss']):.6f}")
 
-    print(f"  Val MSE    : {np.mean(val_err):.6f} ± {np.std(val_err):.6f}")
-    print(f"  Anomaly MSE: {np.mean(anom_err):.6f} ± {np.std(anom_err):.6f}")
-    print(f"  Threshold  : {threshold:.6f}")
-    print(f"  Recall     : {recall*100:.1f}%")
-    print(f"  False positives: {fp}/{len(val_err)}")
+    layers = [tuple(w.astype(np.float32) for w in model.get_layer(n).get_weights())
+              for n, _ in LAYER_NAMES]
+    val_mse   = P.reconstruction_mse(layers, norm_min, norm_scale, val_raw)
+    all_mse   = P.reconstruction_mse(layers, norm_min, norm_scale, np.vstack([train_raw, val_raw]))
+    threshold = float(np.float32(np.percentile(all_mse, THRESHOLD_PERCENTILE)))
+    return model, layers, norm_min.astype(np.float32), norm_scale, threshold, val_mse
 
-    # ── 4. INT8 Quantize ──────────────────────────────────────────────────────
-    print("\n── Step 4: INT8 quantization ───────────────────────────────────")
 
-    def rep_dataset():
-        for i in range(0, len(X_train), 10):
-            yield [X_train[i:i+1].astype(np.float32)]
+def evaluate(test_caps, layers, norm_min, norm_scale, threshold, filter_size):
+    """Run the full device logic over labelled captures, aggregate per scenario."""
+    per_scen, fa, hours, led_pct = {}, 0, 0.0, []
+    for cap in test_caps:
+        feats, valid, fault = P.process_stream(cap.ts, cap.raw, filter_size)
+        mse        = P.reconstruction_mse(layers, norm_min, norm_scale, feats)
+        _, led     = P.run_detector(mse, valid, fault, threshold)
+        res        = P.evaluate_events(cap, led)
+        fa        += res["false_alarms"]
+        hours     += res["normal_hours"]
+        led_pct.append(res["normal_led_pct"])
+        for ev in res["events"]:
+            per_scen.setdefault(ev["scenario"], []).append(ev)
+    return per_scen, fa, hours, float(np.mean(led_pct)) if led_pct else 0.0
 
-    conv = tf.lite.TFLiteConverter.from_keras_model(model)
-    conv.optimizations = [tf.lite.Optimize.DEFAULT]
-    conv.representative_dataset = rep_dataset
-    conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-    conv.inference_input_type  = tf.int8
-    conv.inference_output_type = tf.int8
-    tflite_model = conv.convert()
 
-    fp32_size = sum(np.prod(w.shape) * 4 for w in model.weights)
-    print(f"  FP32 size : {fp32_size} bytes")
-    print(f"  INT8 size : {len(tflite_model)} bytes  ({fp32_size/len(tflite_model):.1f}x smaller)")
+def print_eval(label, per_scen, fa, hours, led_pct):
+    print(f"\n  [{label}]")
+    print(f"  {'scenario':<18}{'detected':>10}{'avg latency':>14}")
+    for sc in sorted(per_scen):
+        evs  = per_scen[sc]
+        hits = [e for e in evs if e["detected"]]
+        lat  = f"{np.mean([e['latency_ms'] for e in hits]) / 1000:.1f} s" if hits else "-"
+        print(f"  {sc:<18}{len(hits):>5}/{len(evs):<4}{lat:>14}")
+    print(f"  false alarms      : {fa} in {hours * 60:.1f} min of normal operation "
+          f"({fa / hours if hours else 0:.1f}/hour)")
+    print(f"  LED on while normal: {led_pct:.2f}% of samples")
 
-    with open(os.path.join(OUTPUT_DIR, "anomaly_model.tflite"), "wb") as f:
-        f.write(tflite_model)
 
-else:
-    threshold    = 0.018
-    tflite_model = bytes([0x18, 0x00, 0x00, 0x00] + [0x00] * 60)
-    print("  SIMULATION: using dummy model + default threshold")
+# ── Header export ─────────────────────────────────────────────────────────────
 
-# ── 5. Export C header ────────────────────────────────────────────────────────
+def fmt(v):
+    """C float literal. 9 significant digits round-trips float32 exactly."""
+    s = f"{float(v):.9g}"
+    if not any(c in s for c in ".en"):   # "0" -> "0.0" ("0f" is not valid C)
+        s += ".0"
+    return s + "f"
 
-print("\n── Step 5: Exporting model_data.h ──────────────────────────────")
 
-def export_header(model_bytes, threshold, data_min, data_max, path):
-    lines = [
-        "// Auto-generated by train.py — DO NOT EDIT",
-        "// Ultrasonic anomaly detector — INT8 quantized autoencoder",
+def c_list(arr):
+    return ", ".join(fmt(v) for v in np.asarray(arr).flatten())
+
+
+def write_headers(layers, norm_min, norm_scale, threshold, train_raw):
+    norm_max = train_raw.max(axis=0)
+    data_lines = [
+        "// Auto-generated by train.py - DO NOT EDIT",
+        "// Ultrasonic anomaly detector - on-device pipeline settings, threshold, normalization",
         "#pragma once",
-        "#include <stdint.h>",
         "",
-        f"// Model flatbuffer ({len(model_bytes)} bytes)",
-        f"const unsigned int g_model_len = {len(model_bytes)};",
-        "alignas(8) const uint8_t g_model_data[] = {",
-    ]
-    data = list(model_bytes)
-    for i in range(0, len(data), 12):
-        row = data[i:i+12]
-        lines.append("  " + ", ".join(f"0x{b:02x}" for b in row) + ",")
-    lines += [
-        "};",
+        "// ── On-device signal pipeline (the model was trained on exactly this) ──",
+        f"#define MODEL_SAMPLE_INTERVAL_MS  {P.SAMPLE_INTERVAL_MS}",
+        f"#define MODEL_VALID_MIN_CM        {fmt(P.VALID_MIN_CM)}",
+        f"#define MODEL_VALID_MAX_CM        {fmt(P.VALID_MAX_CM)}",
+        f"#define MODEL_HAMPEL_SIZE         {P.HAMPEL_SIZE}",
+        f"#define MODEL_HAMPEL_K_MAD        {fmt(P.HAMPEL_K_MAD)}",
+        f"#define MODEL_HAMPEL_MIN_CM       {fmt(P.HAMPEL_MIN_CM)}",
+        f"#define MODEL_WINDOW_SIZE         {P.WINDOW_SIZE}",
+        f"#define MODEL_MAX_GAP_MS          {P.MAX_GAP_MS}",
+        f"#define MODEL_ALARM_ON_COUNT      {P.ALARM_ON_COUNT}",
+        f"#define MODEL_ALARM_OFF_COUNT     {P.ALARM_OFF_COUNT}",
+        f"#define MODEL_FAULT_INVALID_COUNT {P.FAULT_INVALID_COUNT}",
         "",
-        f"const float ANOMALY_THRESHOLD = {threshold:.6f}f;",
+        "// Reconstruction-MSE above this value => anomalous sample",
+        f"const float ANOMALY_THRESHOLD = {fmt(threshold)};",
         "",
-        "// Normalization constants from training data",
-        f"const float NORM_MIN[4] = {{{', '.join(f'{v:.4f}f' for v in data_min)}}};",
-        f"const float NORM_MAX[4] = {{{', '.join(f'{v:.4f}f' for v in data_max)}}};",
+        "// Normalization: x_norm = (x - NORM_MIN) * NORM_SCALE",
+        f"// (training max: {', '.join(f'{v:.4f}' for v in norm_max)})",
+        f"const float NORM_MIN[4]   = {{{c_list(norm_min)}}};",
+        f"const float NORM_SCALE[4] = {{{c_list(norm_scale)}}};",
         "",
         "// Feature indices",
-        "#define FEAT_DISTANCE       0   // cm",
+        "#define FEAT_DISTANCE       0   // filtered distance, cm",
         "#define FEAT_JITTER         1   // std dev over window",
         "#define FEAT_RATE_OF_CHANGE 2   // |delta| per second",
         "#define FEAT_VARIANCE       3   // variance over window",
     ]
-    with open(path, "w") as f:
-        f.write("\n".join(lines) + "\n")
-    print(f"  Saved → {path}")
-
-export_header(tflite_model, threshold, data_min, data_max,
-              os.path.join(OUTPUT_DIR, "model_data.h"))
-# ── Step 6: Export C++ weights header ────────────────────────────────────────
-print("\n── Step 6: Exporting model_weights.h ───────────────────────────")
-
-if TF_AVAILABLE:
-    def arr2c_define(arr, name):
-        flat = arr.flatten().tolist()
-        vals = ", ".join(f"{v:.6f}f" for v in flat)
-        return f"#define {name} {{{vals}}}"
-
-    w = {weight.name: weight.numpy() for weight in model.weights}
-
     weight_lines = [
-        "// Auto-generated by train.py — DO NOT EDIT",
+        "// Auto-generated by train.py - DO NOT EDIT",
+        "// Autoencoder 4-8-2-8-4. Kernels are row-major [in][out] (Keras Dense layout).",
         "#pragma once",
         "",
-        arr2c_define(w['enc1/kernel:0'],   'WEIGHTS_ENC1'),
-        arr2c_define(w['enc1/bias:0'],     'BIAS_ENC1'),
-        arr2c_define(w['latent/kernel:0'], 'WEIGHTS_ENC2'),
-        arr2c_define(w['latent/bias:0'],   'BIAS_ENC2'),
-        arr2c_define(w['dec1/kernel:0'],   'WEIGHTS_DEC1'),
-        arr2c_define(w['dec1/bias:0'],     'BIAS_DEC1'),
-        arr2c_define(w['out/kernel:0'],    'WEIGHTS_DEC2'),
-        arr2c_define(w['out/bias:0'],      'BIAS_DEC2'),
     ]
+    for (k, b), (_, c_name) in zip(layers, LAYER_NAMES):
+        weight_lines.append(f"#define WEIGHTS_{c_name} {{{c_list(k)}}}")
+        weight_lines.append(f"#define BIAS_{c_name} {{{c_list(b)}}}")
 
-    weights_path = os.path.join(OUTPUT_DIR, "model_weights.h")
-    with open(weights_path, "w") as f:
-        f.write("\n".join(weight_lines) + "\n")
-    print(f"  Saved → {weights_path}")
-else:
-    # Simulation mode — dummy weights (all zeros)
-    weight_lines = [
-        "// DUMMY weights — run train.py with TensorFlow installed",
-        "#pragma once",
-        "#define WEIGHTS_ENC1 {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f}",
-        "#define BIAS_ENC1    {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f}",
-        "#define WEIGHTS_ENC2 {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f}",
-        "#define BIAS_ENC2    {0.0f,0.0f}",
-        "#define WEIGHTS_DEC1 {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f}",
-        "#define BIAS_DEC1    {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f}",
-        "#define WEIGHTS_DEC2 {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f}",
-        "#define BIAS_DEC2    {0.0f,0.0f,0.0f,0.0f}",
-    ]
-    weights_path = os.path.join(OUTPUT_DIR, "model_weights.h")
-    with open(weights_path, "w") as f:
-        f.write("\n".join(weight_lines) + "\n")
-    print(f"  Saved → {weights_path} (dummy — install TensorFlow for real weights)")
-print("\n✅ Done!")
-print("   Copy output/model_data.h → firmware/include/model_data.h")
-print("   Then: cd firmware && pio run --target upload")
+    paths = []
+    for name, lines in (("model_data.h", data_lines), ("model_weights.h", weight_lines)):
+        path = os.path.join(OUTPUT_DIR, name)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"  Saved → {os.path.relpath(path, SCRIPT_DIR)}")
+        paths.append(path)
+    return paths
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--normal-dir", default=os.path.join(SCRIPT_DIR, "data", "normal"),
+                    help="folder of normal-operation captures (*.csv)")
+    ap.add_argument("--test-dir", default=os.path.join(SCRIPT_DIR, "data", "test"),
+                    help="folder of labelled test captures (*.csv); optional")
+    ap.add_argument("--compare-raw", action="store_true",
+                    help="also train/evaluate a model without any cleaning")
+    ap.add_argument("--no-copy", action="store_true", help="don't copy headers into firmware/include")
+    args = ap.parse_args()
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # 1. Load ------------------------------------------------------------------
+    banner("Step 1: Raw data quality")
+    normal_caps = P.load_dir(args.normal_dir)
+    test_caps   = [c for c in P.load_dir(args.test_dir) if c.label is not None] \
+        if os.path.isdir(args.test_dir) else []
+    if not normal_caps:
+        sys.exit(f"No *.csv captures in {args.normal_dir}. Run generate_data.py or capture_serial.py.")
+
+    keys = ["rows", "timeouts", "blind_zone", "over_range", "gaps", "reboots", "junk_lines", "duplicates"]
+    print(f"  {'capture':<26}" + "".join(f"{k[:9]:>10}" for k in keys))
+    for cap in normal_caps + test_caps:
+        q = P.raw_quality(cap)
+        print(f"  {cap.name:<26}" + "".join(f"{q[k]:>10}" for k in keys))
+
+    # 2-3. Clean → features ----------------------------------------------------
+    banner("Step 2-3: On-device cleaning + offline contamination removal")
+    print(f"  on-device : valid {P.VALID_MIN_CM:g}-{P.VALID_MAX_CM:g} cm, Hampel-{P.HAMPEL_SIZE} spike filter, "
+          f"window {P.WINDOW_SIZE}, reset after {P.MAX_GAP_MS} ms gap")
+    train_raw, val_raw = build_dataset(normal_caps, P.HAMPEL_SIZE, offline_clean=True)
+    print(f"  train rows: {len(train_raw)}   val rows: {len(val_raw)}")
+
+    # 4. Train -----------------------------------------------------------------
+    banner("Step 4: Training autoencoder (normal data only)")
+    model, layers, norm_min, norm_scale, threshold, val_mse = train_model(train_raw, val_raw)
+    model.summary(print_fn=lambda s: print("  " + s) if "params" in s else None)
+
+    # 5. Threshold + evaluation ------------------------------------------------
+    banner("Step 5: Threshold & full-pipeline evaluation")
+    print(f"  val MSE   : {np.mean(val_mse):.6f} ± {np.std(val_mse):.6f}")
+    print(f"  threshold : {threshold:.6f}  ({THRESHOLD_PERCENTILE:g}th percentile of normal MSE; "
+          f"{100 * np.mean(val_mse > threshold):.2f}% of val samples above it)")
+    print(f"  alarm     : {P.ALARM_ON_COUNT} anomalous samples to raise, "
+          f"{P.ALARM_OFF_COUNT} normal to clear; fault after {P.FAULT_INVALID_COUNT} invalid")
+    if test_caps:
+        print_eval("with cleaning (deployed)",
+                   *evaluate(test_caps, layers, norm_min, norm_scale, threshold, P.HAMPEL_SIZE))
+        if args.compare_raw:
+            print("\n  training comparison model without cleaning...")
+            b_train, b_val = build_dataset(normal_caps, filter_size=1, offline_clean=False)
+            _, b_layers, b_min, b_scale, b_thr, _ = train_model(b_train, b_val)
+            print_eval("WITHOUT cleaning (comparison only)",
+                       *evaluate(test_caps, b_layers, b_min, b_scale, b_thr, filter_size=1))
+    else:
+        print("  (no labelled test captures - skipping evaluation)")
+
+    # 6. Export + verify + copy --------------------------------------------------
+    banner("Step 6: Export, verify, copy")
+    paths = write_headers(layers, norm_min, norm_scale, threshold, train_raw)
+
+    x_val = ((val_raw - norm_min) * norm_scale).astype(np.float32)
+    keras_diff = float(np.max(np.abs(P.forward(layers, x_val) - model.predict(x_val, verbose=0))))
+    h_layers, h_min, h_scale, h_thr = P.load_model_headers(OUTPUT_DIR)
+    header_diff = float(np.nanmax(np.abs(
+        P.reconstruction_mse(h_layers, h_min, h_scale, val_raw) - val_mse)))
+    print(f"  C-forward vs Keras   max |diff| = {keras_diff:.2e}")
+    print(f"  headers round-trip   max |diff| = {header_diff:.2e}")
+    if keras_diff > 1e-4 or header_diff > 1e-6 or np.float32(h_thr) != np.float32(threshold):
+        sys.exit("  ✗ Exported model does not match - not copying to firmware.")
+
+    if args.no_copy:
+        print("  (--no-copy: firmware/include left untouched)")
+    elif os.path.isdir(FIRMWARE_INCLUDE):
+        for src in paths:
+            dst = os.path.join(FIRMWARE_INCLUDE, os.path.basename(src))
+            shutil.copyfile(src, dst)
+            print(f"  Copied → {os.path.normpath(dst)}")
+    else:
+        print("  firmware/include not found - copy the headers manually.")
+
+    print("\n✅ Done!  Next: python verify_firmware.py   then   cd ../firmware && pio run -t upload")
+
+
+if __name__ == "__main__":
+    main()

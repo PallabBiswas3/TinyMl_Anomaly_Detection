@@ -44,3 +44,7 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+
+# Local-only docs (not part of the repo)
+INTERVIEW_GUIDE.md
+CLAUDE.md

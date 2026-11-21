@@ -1,2 +1,3 @@
 tensorflow>=2.13.0
 numpy>=1.24.0
+pyserial>=3.5     # capture_serial.py (recording real data from the ESP32)
